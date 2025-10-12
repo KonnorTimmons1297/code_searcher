@@ -10,6 +10,7 @@
 #import "Math";
 #import "Hash_Table";
 #import "Text_File_Handler";
+#import "System";
 
 DEBUG :: false;
 
@@ -19,73 +20,76 @@ window_height : s32 = 1080;
 theme: Overall_Theme;
 
 TheFont: *Dynamic_Font;
+LineHeight := 0.0;
 LoadFont :: () {
     TheFont = get_font_at_size("data", "ProggyVector-Regular.ttf", xx (window_height/64.0));
+    LineHeight = xx TheFont.character_height * 1.5;
 }
 
 scroll_region_value: float;
 scroll_region_value_for_file_contents: float;
 scroll_region_value_for_search_dirs: float;
 
-ExecuteQueryForFile :: (query: string, file_index: s64) {
-	file: *LoadedFile = *Files[file_index];
-    if !file.loaded {
-        log("Loading file %", file.path);
-        file.contents, file.loaded = read_entire_file(file.path);
-        if !file.loaded then {
-            log("Failed to load file %", file.path);
-            return;
-        }
-
-        dup_ptr := file.contents;
-        start_of_line_index := 0;
-        end_of_line_index := 0;
-        for index: 0..file.contents.count-1 {
-        	char := file.contents[index];
-        	if char == #char "\n" {
-        		end_of_line_index := index;
-        		line: Line;
-        		line.index = start_of_line_index;
-        		line.text = file.contents;
-        		line.text.count = index+1;
-        		advance(*line.text, start_of_line_index);
-				// line.text = trim(line.text);
-
-				// log("line %: %", file.lines.count+1, line.text);
-
-        		array_add(*file.lines, line);
-
-        		// "abcd1234\nsjdflaksdjf\n"
-        		//            ^
-        		//       start of line
-
-        		start_of_line_index = index+1;
-        	}
-        }
-    }
-    if file.loaded {
-    	for line: file.lines {
-    		if contains(line.text, query) {
-	    		query_result: QueryResult;
-	            query_result.file_index = file_index;
-	            query_result.line_index = it_index;
-	            lock(*TheMutex);
-	            array_add(*QueryResults, query_result);
-	            unlock(*TheMutex);
-    		}
-    	}
-    }
+ClearQueryResults :: () {
+    lock(*QueryResultsMutex);
+    array_reset(*QueryResults);
+    unlock(*QueryResultsMutex);
 }
 
 ExecuteQuery :: (query: string) {
     if query.count == 0 then return;
 
-    lock(*QueryMutex);
-    array_reset(*QueryResults);
-    unlock(*QueryMutex);
+	ClearQueryResults();
 
     for file_index: 0..Files.count-1 {
-        ExecuteQueryForFile(query, file_index);
+        file: *LoadedFile = *Files[file_index];
+		//log("Executing Query for file: %", file.path);
+	    if !file.loaded {
+	        log("Loading file %", file.path);
+	        file.contents, file.loaded = read_entire_file(file.path);
+	        if !file.loaded then {
+	            log("Failed to load file %", file.path);
+	            return;
+	        }
+
+	        dup_ptr := file.contents;
+	        start_of_line_index := 0;
+	        end_of_line_index := 0;
+	        for index: 0..file.contents.count-1 {
+	        	char := file.contents[index];
+	        	if char == #char "\n" {
+	        		end_of_line_index := index;
+	        		line: Line;
+	        		line.index = start_of_line_index;
+	        		line.text = file.contents;
+	        		line.text.count = index+1;
+	        		advance(*line.text, start_of_line_index);
+					// line.text = trim(line.text);
+
+					// log("line %: %", file.lines.count+1, line.text);
+
+	        		array_add(*file.lines, line);
+
+	        		// "abcd1234\nsjdflaksdjf\n"
+	        		//            ^
+	        		//       start of line
+
+	        		start_of_line_index = index+1;
+	        	}
+	        }
+	    }
+	    if file.loaded {
+	    	for line: file.lines {
+	    		if contains(line.text, query) {
+		    		query_result: QueryResult;
+		            query_result.file_index = file_index;
+		            query_result.line_index = it_index;
+		            lock(*QueryResultsMutex);
+		            array_add(*QueryResults, query_result);
+		            unlock(*QueryResultsMutex);
+	    		}
+	    	}
+	    }
     }
 }
 
@@ -110,13 +114,15 @@ QueryResult :: struct {
 QueryResults: [..]QueryResult;
 
 
-TheMutex: Mutex;
+QueryResultsMutex: Mutex;
 QueryMutex: Mutex;
+DirectoriesToSearchMutex: Mutex;
 ExecutingQuery := false;
 
 DirectoryState :: struct {
 	path: string;
 	scanned := false;
+	removed := false;
 }
 
 VaildFiletypes: [..]string;
@@ -159,13 +165,41 @@ QueryThreadInitialized := false;
 QueryThread: Thread;
 QueryThreadProc :: (thread: *Thread) -> s64 {
 	while true {
-        lock(*TheMutex);
+        lock(*QueryMutex);
         query_updated := LastQuery != Query;
         if query_updated then LastQuery = Query;
-        for *directory: DirectoriesToSearch {
-        	if !directory.scanned then ScanDirectory(directory);
-        }
-        unlock(*TheMutex);
+        unlock(*QueryMutex);
+
+		lock(*DirectoriesToSearchMutex);
+			removed_directories: [..]DirectoryState;
+			removed_directories.allocator = temp;
+
+			for *directory: DirectoriesToSearch {
+				if directory.removed {
+					array_add(*removed_directories, directory.*);
+					remove directory;
+					continue;
+				} else if !directory.scanned {
+					ScanDirectory(directory);
+				}
+			}
+
+		unlock(*DirectoriesToSearchMutex);
+
+		if removed_directories.count {
+			ClearQueryResults(); // do not want anyone touching the data if/when it's freed.
+		}
+
+		for removed_directory: removed_directories {
+			log("Removing directory: %", removed_directory.path);
+
+			for *file, file_index: Files {
+				if contains(file.path, removed_directory.path) {
+					if file.contents then free(file.contents);
+					remove file;
+				}
+			}
+		}
 
         if query_updated {
             log("Query updated: %", LastQuery);
@@ -186,20 +220,23 @@ DrawQuerySelection :: (destination_rect: Rect) {
 	max_items := 250;//cast(s64) ceil(r.h / query_input_rect.h);
 
     result_item_rect := results_display_rect;
-    result_item_rect.h = TheFont.character_height*1.5;
+    result_item_rect.h = LineHeight;
 	result_item_rect.y -= scroll_region_value;
 
 	files_drawn: [..]string;
 	files_drawn.allocator = temp;
 
-    lock(*TheMutex);
+    lock(*QueryResultsMutex);
     for *QueryResults {
     	file := Files[it.file_index];
     	line := file.lines[it.line_index];
 
+    	// NOTE: Keeping track of drawn file names in an array,
+    	//       we check to see if the file name has been drawn 
+    	//       yet. If it hasn't, then we draw the file name!
     	if !array_find(files_drawn, file.name) {
     		label(result_item_rect, file.path, *theme.label_theme);
-    		result_item_rect.y += TheFont.character_height*1.5;
+    		result_item_rect.y += LineHeight;
     		array_add(*files_drawn, file.name);
     	}
 
@@ -209,10 +246,10 @@ DrawQuerySelection :: (destination_rect: Rect) {
             SelectedQueryResult = it;
             ScrollToSelectedLine = true;
         }
-        result_item_rect.y += TheFont.character_height*1.5;
+        result_item_rect.y += LineHeight;
         if it_index == max_items then break;
     }
-    unlock(*TheMutex);
+    unlock(*QueryResultsMutex);
 
     end_scrollable_region(scrollable_region, 0, result_item_rect.y + result_item_rect.h, *scroll_region_value);
 }
@@ -221,112 +258,154 @@ Query: string;
 SelectedQueryResult: *QueryResult;
 ScrollToSelectedLine := false;
 
+SearchDirectoryInput: string;
+
 AddSearchDirectory :: (path: string) {
 	directory: DirectoryState;
 	directory.path = path;
-	lock(*TheMutex);
+	lock(*DirectoriesToSearchMutex);
 	array_add(*DirectoriesToSearch, directory);
-	unlock(*TheMutex);
+	unlock(*DirectoriesToSearchMutex);
 }
 
-SettingsSubwindow: Subwindow_Info;
-AddDirectoryInput: string;
-DrawSettingsSubwindow :: (state: *Subwindow_State, r: Rect, data: *void) {
-	add_directory_input_rect := r;
-	add_directory_input_rect.h = xx TheFont.character_height*1.5;
-	result_action, new_text, state := text_input(add_directory_input_rect, AddDirectoryInput, *theme.text_input_theme);
-    if result_action & .TEXT_MODIFIED {
-        // log("result_action: %, state.text=%", result_action, state.text);
-        modify_string(*AddDirectoryInput, state.text);
-    } else if result_action & .ENTERED {
-    	directory_to_add := copy_string(AddDirectoryInput);
-    	AddSearchDirectory(directory_to_add);
-    	state.text = "";
-    	modify_string(*AddDirectoryInput, "");
-    }
+// SettingsSubwindow: Subwindow_Info;
+// AddDirectoryInput: string;
+// DrawSettingsSubwindow :: (state: *Subwindow_State, r: Rect, data: *void) {
+// 	line_height := TheFont.character_height*1.5;
+// 	my_rect := r;
+// 	my_rect.h = line_height;
+// 	{
+// 		label(my_rect, "Search Directories", *theme.label_theme);
+// 	}
+// 	my_rect.y += my_rect.h;
 
-    x_glyph_width := prepare_text(TheFont, "+") * 3;
+// 	{
+// 		add_directory_input_rect := my_rect;
+// 		result_action, new_text, state := text_input(add_directory_input_rect, AddDirectoryInput, *theme.text_input_theme);
+// 	    if result_action & .TEXT_MODIFIED {
+// 	        modify_string(*AddDirectoryInput, state.text);
+// 	    } else if result_action & .ENTERED {
+// 	    	directory_to_add := copy_string(AddDirectoryInput);
+// 	    	AddSearchDirectory(directory_to_add);
+// 	    	state.text = "";
+// 	    	modify_string(*AddDirectoryInput, "");
+// 	    }
+// 	}
+//     my_rect.y += my_rect.h;
 
-	search_directory_list_rect := r;
-	search_directory_list_rect.y += add_directory_input_rect.h;
+// 	{
+// 		search_directory_list_rect := my_rect;
+// 		search_directory_list_rect.h = r.h;
+// 		x_glyph_width := prepare_text(TheFont, "-") * 3;
+// 		scrollable_region_theme := theme.scrollable_region_theme;
+// 	    scrollable_state, scrollabe_rect :=
+// 	    	begin_scrollable_region(search_directory_list_rect, *scrollable_region_theme);
 
-	{
-		scrollable_region_theme := theme.scrollable_region_theme;
-	    scrollable_state, scrollabe_rect :=
-	    	begin_scrollable_region(search_directory_list_rect, *scrollable_region_theme);
+// 	    search_directory_item_rect := scrollabe_rect;
+// 	    search_directory_item_rect.h = line_height;
+// 		search_directory_item_rect.y -= scroll_region_value_for_search_dirs;
 
-	    search_directory_label_rect := scrollabe_rect;
-	    search_directory_label_rect.h = TheFont.character_height*1.5;
-		search_directory_label_rect.y -= scroll_region_value_for_search_dirs;
+// 		directory_label_rect := search_directory_item_rect;
+// 		directory_label_rect.w -= x_glyph_width;
 
-		lock(*TheMutex);
+// 		remove_directory_button_rect := directory_label_rect;
+// 		remove_directory_button_rect.x += directory_label_rect.w;
+// 		remove_directory_button_rect.w = xx x_glyph_width;
 
-		for directory: DirectoriesToSearch {
-			label(search_directory_label_rect, directory.path, *theme.label_theme);
-			search_directory_label_rect.y += search_directory_label_rect.h;
-		}
+// 		lock(*DirectoriesToSearchMutex);
 
-		unlock(*TheMutex);
+// 			for *directory: DirectoriesToSearch {
+// 				label(search_directory_item_rect, directory.path, *theme.label_theme);
+// 				remove_pressed := button(remove_directory_button_rect, "-", *theme.button_theme, identifier = it_index);
+// 				if remove_pressed {
+// 					directory.removed = true;
+// 				}
+// 				search_directory_item_rect.y += search_directory_item_rect.h;
+// 				remove_directory_button_rect.y += remove_directory_button_rect.h;
+// 			}
 
-	    end_scrollable_region(scrollable_state, 0, search_directory_label_rect.y, *scroll_region_value_for_search_dirs);
-	}
+// 		unlock(*DirectoriesToSearchMutex);
 
+// 	    end_scrollable_region(scrollable_state, 0, search_directory_item_rect.y, *scroll_region_value_for_search_dirs);
+// 	}
+// }
+
+AfterSearchCriteriaChanged :: () {
+	SelectedQueryResult = null;
 }
+
+// TODO: Consider moving the searching logic into it's own file
 
 main :: () {
-	tfh: Text_File_Handler;
-	start_file(*tfh, "settings", "settings.txt");
-	if tfh.failed {
-		log_error("Failed to load settings");
-		return;
-	}
 
-	Readmode :: enum {
-		None;
-		Filetypes;
-		Directories;
-	}
+	init(*QueryResultsMutex);
+    init(*QueryMutex);
+	init(*DirectoriesToSearchMutex);
 
-	mode := Readmode.None;
-	line, found := consume_next_line(*tfh);
-	while found {
-		if line == ":: Filetypes" {
-			mode = .Filetypes;
-		} else if line == ":: Directories" {
-			mode = .Directories;
-		} else {
-			if mode == {
-				case .Filetypes; {
-					filetype := copy_string(line);
-					if !begins_with(filetype, ".") {
-						modify_string(*filetype, sprint(".%", line));
+	exe_filepath := get_path_of_running_executable();
+	exe_filepath.count = find_index_from_right(exe_filepath, "/");
+	settings_filename := "code_search_settings.txt";
+	settings_file_filepath := sprint("%/%", exe_filepath, settings_filename);
+	
+	if file_exists(settings_file_filepath) {
+		tfh: Text_File_Handler;
+		start_file(*tfh, "settings", settings_file_filepath);
+		if tfh.failed {
+			log_error("Failed to load settings");
+			return;
+		}
+
+		Readmode :: enum {
+			None;
+			Filetypes;
+			Directories;
+		}
+
+		mode := Readmode.None;
+		line, found := consume_next_line(*tfh);
+		while found {
+			if line == ":: Filetypes" {
+				mode = .Filetypes;
+			} else if line == ":: Directories" {
+				mode = .Directories;
+			} else {
+				if mode == {
+					case .Filetypes; {
+						filetype := copy_string(line);
+						if !begins_with(filetype, ".") {
+							modify_string(*filetype, sprint(".%", line));
+						}
+						array_add(*VaildFiletypes, filetype);
+						log("Filetype: %", line);
 					}
-					array_add(*VaildFiletypes, filetype);
-					log("Filetype: %", line);
-				}
-				case .Directories; {
-					dir: DirectoryState;
-					dir.path = copy_string(line);
-					array_add(*DirectoriesToSearch, dir);
-					log("Directory: %", dir.path);
+					case .Directories; {
+						dir: DirectoryState;
+						dir.path = copy_string(line);
+						array_add(*DirectoriesToSearch, dir);
+						log("Directory: %", dir.path);
+					}
 				}
 			}
+			line, found = consume_next_line(*tfh);
 		}
-		line, found = consume_next_line(*tfh);
+
+		deinit(*tfh);
+	} else {
+		array_add(*VaildFiletypes, ".jai");
+		AddSearchDirectory(copy_string(get_working_directory()));
 	}
 
-	deinit(*tfh);
-
-	array_add(*VaildFiletypes, ".jai");
-	array_add(*VaildFiletypes, ".txt");
-	array_add(*VaildFiletypes, ".c");
-	array_add(*VaildFiletypes, ".h");
-	array_add(*VaildFiletypes, ".cpp");
-	array_add(*VaildFiletypes, ".kt");
-	array_add(*VaildFiletypes, ".java");
+	initial_search_directory_input_sb: String_Builder;
+	init_string_builder(*initial_search_directory_input_sb);
+	for dir: DirectoriesToSearch {
+		print_to_builder(*initial_search_directory_input_sb, "%;", dir.path);
+	}
+	for filetype: VaildFiletypes {
+		print_to_builder(*initial_search_directory_input_sb, "%;", tprint("*%", filetype));
+	}
 
     Query = copy_string("");
-    AddDirectoryInput = copy_string("");
+    SearchDirectoryInput = copy_string(builder_to_string(*initial_search_directory_input_sb));
 
     thread_initialized := thread_init(*QueryThread, QueryThreadProc);
     if !thread_initialized {
@@ -335,8 +414,7 @@ main :: () {
     }
     thread_start(*QueryThread);
 
-    init(*TheMutex);
-    init(*QueryMutex);
+    
 
     window := create_window(window_width, window_height, "Code Searcher");
 
@@ -346,10 +424,10 @@ main :: () {
 
     LoadFont();
 
-    SettingsSubwindow.rect = get_rect(100, 100, 0.15 * window_width, TheFont.character_height*20.0);
-	SettingsSubwindow.title_text = "Settings";
-	SettingsSubwindow.draw = DrawSettingsSubwindow;
-	SettingsSubwindow.open = false;
+    // SettingsSubwindow.rect = get_rect(100, 100, 0.15 * window_width, TheFont.character_height*20.0);
+	// SettingsSubwindow.title_text = "Settings";
+	// SettingsSubwindow.draw = DrawSettingsSubwindow;
+	// SettingsSubwindow.open = false;
 
     last_loop_elapsed_time: float64 = 0;
     program_is_running := true;
@@ -389,34 +467,107 @@ main :: () {
         theme.label_theme.font = TheFont;
         theme.label_theme.alignment = .Left;
         theme.text_input_theme.font = TheFont;
+        theme.scrollable_region_theme.region_background.shape.rounding_flags = 0;
         set_default_theme(theme);
 
-        settings_button_rect: Rect;
-        settings_button_rect.h = TheFont.character_height*1.5;
-        settings_button_rect.w = prepare_text(TheFont, "Settings")*1.5;
-        settings_button_rect.x = window_width - settings_button_rect.w;
+        search_directories_label_rect: Rect;
+        search_directories_label_rect.w = xx prepare_text(TheFont, "Env  ");
+        search_directories_label_rect.h = LineHeight;
+
+        label(search_directories_label_rect, "Env", *theme.label_theme);
+
+        search_directories_input_rect: Rect;
+        search_directories_input_rect.x += search_directories_label_rect.w;
+        search_directories_input_rect.w = (window_width - search_directories_label_rect.w);
+        search_directories_input_rect.h = LineHeight;
+
+        { // search directories input
+            result_action, new_text, state := text_input(search_directories_input_rect, SearchDirectoryInput, *theme.text_input_theme);
+            if result_action & .TEXT_MODIFIED {
+            	log("SearchDirectoryInput=%", SearchDirectoryInput);
+            	modify_string(*SearchDirectoryInput, state.text);
+            } else if result_action & .ENTERED {
+            	input_directories := split(SearchDirectoryInput, ";",, temp);
+            	for user_input_directory: input_directories {
+            		if trim(user_input_directory).count == 0 {
+            			continue;
+            		}
+
+            		if user_input_directory[0] == #char "." {
+            			// TODO:
+            			// Check if already added to valid list
+            			// Add to list if not already added
+            			// Tell the system to rescan for those files
+            		}
+
+            		directory_exists := file_exists(user_input_directory);
+            		if !directory_exists {
+            			log_error("Directory '%' is malformed or does not exist", user_input_directory);
+            			continue;
+            		}
+
+					directory_loaded := false;
+
+            		lock(*DirectoriesToSearchMutex);
+            		for tracked_directory: DirectoriesToSearch {
+            			if tracked_directory.path == user_input_directory {
+            				directory_loaded = true;
+            				break;
+            			}
+            		}
+            		unlock(*DirectoriesToSearchMutex);
+
+            		if !directory_loaded {
+            			AddSearchDirectory(copy_string(user_input_directory));
+            		}
+            	}
+
+	        	lock(*DirectoriesToSearchMutex);
+				for *search_dir: DirectoriesToSearch {
+					if !array_find(input_directories, search_dir.path) {
+						search_dir.removed = true;
+					}
+				}
+				unlock(*DirectoriesToSearchMutex);
+            }
+        } // search directories input
+
+        // settings_button_rect: Rect;
+        // settings_button_rect.h = TheFont.character_height*1.5;
+        // settings_button_rect.w = prepare_text(TheFont, "Settings")*1.5;
+        // settings_button_rect.x = window_width - settings_button_rect.w;
+
+        query_label_rect: Rect;
+        query_label_rect.y += LineHeight;
+        query_label_rect.h = LineHeight;
+        query_label_rect.w = xx prepare_text(TheFont, "Query  ");
+
+        label(query_label_rect, "Query", *theme.label_theme);
 
         query_input_rect: Rect;
-        query_input_rect.h = TheFont.character_height*1.5;
-        query_input_rect.w = window_width - settings_button_rect.w;
+        query_input_rect.x += query_label_rect.w;
+        query_input_rect.y += LineHeight;
+        query_input_rect.h = LineHeight;
+        query_input_rect.w = (window_width - query_label_rect.w);
 
-        {
+        { // search text input
             result_action, new_text, state := text_input(query_input_rect, Query, *theme.text_input_theme);
             if result_action & .TEXT_MODIFIED {
                 lock(*QueryMutex);
                 modify_string(*Query, state.text);
                 unlock(*QueryMutex);
-                SelectedQueryResult = null;
+                AfterSearchCriteriaChanged();
             }
-        }
+        } // search text input
 
-		button_theme := theme.button_theme;
-		button_theme.alignment = .Center;
-        settings_button_pressed := button(settings_button_rect, "Settings", *button_theme);
-        if settings_button_pressed {
-        	SettingsSubwindow.open = true;
-        }
-
+		// { // settings button
+		// 	button_theme := theme.button_theme;
+		// 	button_theme.alignment = .Center;
+	    //     settings_button_pressed := button(settings_button_rect, "Settings", *button_theme);
+	    //     if settings_button_pressed {
+	    //     	SettingsSubwindow.open = true;
+	    //     }
+	    // } // settings button
 
         if SelectedQueryResult {
         	selected_file := Files[SelectedQueryResult.file_index];
@@ -437,8 +588,7 @@ main :: () {
 
 			{ // begin selection preview section
 	            selection_preview_rect := second_rect;
-	            selection_preview_rect.y += global_frame_thickness_in_pixels;
-	            selection_preview_rect.h -= global_frame_thickness_in_pixels*2;
+	            selection_preview_rect.y += 4.0; // this is global_frame_thickness
 
 	            file_path_rect := selection_preview_rect;
 				file_path_rect.h = xx TheFont.character_height;
@@ -461,6 +611,7 @@ main :: () {
 					file_contents_line_rect.h = xx TheFont.character_height;
 					file_contents_line_rect.y -= scroll_region_value_for_file_contents;
 					for line_index: 0..selected_file.lines.count-1 {
+						file_contents_line_rect.x = file_contents_scrollable_rect.x;
 						line := selected_file.lines[line_index];
 
 						if line_index == SelectedQueryResult.line_index {
@@ -474,7 +625,34 @@ main :: () {
 								color = theme.background_color_bright);
 							draw_procs.immediate_flush();
 						}
-						label(file_contents_line_rect, trim_right(line.text), *theme.label_theme);
+
+
+
+						// TODO: Do this when the file is loaded
+						current_line := trim_right(line.text);
+						current_line = replace(current_line, "\t", "    ",, temp);
+
+						// current_line := line.text;//trim_right(line.text);
+						//normalized_line_text = replace(normalized_line_text, "\t", "    ");
+
+						// if contains(current_line, #char "\t") {
+						// 	space_width := prepare_text(TheFont, " ");
+						// 	how_much_to_advance_line := 0;
+
+						// 	for line_char, line_index: current_line {
+						// 		if line_char != #char "\t" then break;
+						// 		how_much_to_advance_line += 1;
+						// 		file_contents_line_rect.x += space_width * 4;
+						// 	}
+
+						// 	advance(*current_line, how_much_to_advance_line);
+						// }
+
+						// if current_line.count > 0 && current_line[current_line.count-1] == #char "\n" {
+						// 	current_line.count -= 1;
+						// }
+
+						label(file_contents_line_rect, current_line, *theme.label_theme);
 						file_contents_line_rect.y += file_contents_line_rect.h;
 					}
 
@@ -492,9 +670,9 @@ main :: () {
             DrawQuerySelection(r);
         }
 
-        if SettingsSubwindow.open {
-        	add_subwindow(*SettingsSubwindow, *theme.subwindow_theme);
-        }
+        // if SettingsSubwindow.open {
+        // 	add_subwindow(*SettingsSubwindow, *theme.subwindow_theme);
+        // }
 
         draw_popups();
 
@@ -502,9 +680,31 @@ main :: () {
 
 		reset_temporary_storage();
 
-        sleep_milliseconds(8);
+        sleep_milliseconds(15);
 
         last_loop_elapsed_time = to_float64_seconds(current_time_monotonic() - time_at_beginning_of_loop);
+	}
+
+	{
+		settings_sb: String_Builder;
+		init_string_builder(*settings_sb);
+		print_to_builder(*settings_sb, "[1]\n\n");
+
+		print_to_builder(*settings_sb, ":: Filetypes\n");
+		for filetype: VaildFiletypes {
+			print_to_builder(*settings_sb, "%\n", filetype);
+		}
+
+		print_to_builder(*settings_sb, "\n:: Directories\n");
+		for directory: DirectoriesToSearch {
+			print_to_builder(*settings_sb, "%\n", directory.path);
+		}
+
+		if write_entire_file(settings_file_filepath, builder_to_string(*settings_sb)) {
+
+		} else {
+			log("Failed to update settings");
+		}
 	}
 }
 
